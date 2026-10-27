@@ -1,0 +1,1 @@
+# fantrax-trade-optimizer
