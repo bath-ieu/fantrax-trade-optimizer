@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 
-# Configuration de la page
+# Configuration de la page Streamlit
 st.set_page_config(page_title="Fantrax Trade Optimizer", page_icon="🏒", layout="wide")
 
 # --- DESIGN DARK MODE FANTRAX ---
@@ -48,149 +48,135 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("🏒 Fantrax Trade Optimizer (avec Projections NHL)")
-st.markdown("*Analyse les échanges en croisant les données Fantrax avec les statistiques réelles de la LNH.*")
+st.title("🏒 Fantrax Trade Optimizer")
+st.markdown("*Analyse et simulation d'échanges basées sur les données réelles de votre ligue.*")
 
-# ID de ligue par défaut
 DEFAULT_LEAGUE_ID = "35oi8ycimudcfy7x"
 
 # --- BARRE LATÉRALE ---
 st.sidebar.header("⚙️ Configuration")
 league_id = st.sidebar.text_input("League ID Fantrax", value=DEFAULT_LEAGUE_ID)
 
-@st.cache_data(ttl=3600)
-def fetch_nhl_stats():
-    """Récupère les statistiques officielles récentes de la LNH via l'API NHL."""
-    url = "https://api-web.nhle.com/v1/skater-stats-leaders/current?categories=points&limit=-1"
-    try:
-        res = requests.get(url)
-        if res.status_code == 200:
-            data = res.json()
-            nhl_dict = {}
-            # Parcours des leaders de points
-            for category in data.get("points", []):
-                p_name = f"{category.get('firstName', {}).get('default', '')} {category.get('lastName', {}).get('default', '')}"
-                nhl_dict[p_name] = {
-                    "goals": category.get("value", 0),
-                    "team": category.get("teamAbbrev", "N/A"),
-                    "position": category.get("position", "F")
-                }
-            return nhl_dict
-    except Exception as e:
-        st.sidebar.warning("⚠️ Impossible de joindre l'API NHL, utilisation des projections par défaut.")
-    return {}
-
-@st.cache_data(ttl=300)
-def fetch_fantrax_data(l_id):
-    """Récupère les informations des équipes Fantrax."""
+@st.cache_data(ttl=600)
+def load_league_from_fantrax(l_id):
+    """
+    Récupère les informations des équipes et résout la correspondance 
+    des joueurs via l'API Fantrax et l'API NHL.
+    """
     info_url = f"https://www.fantrax.com/fxea/general/getLeagueInfo?leagueId={l_id}"
     rosters_url = f"https://www.fantrax.com/fxea/general/getTeamRosters?leagueId={l_id}"
     
-    try:
-        info_res = requests.get(info_url)
-        rosters_res = requests.get(rosters_url)
-        info_data = info_res.json() if info_res.status_code == 200 else {}
-        rosters_data = rosters_res.json() if rosters_res.status_code == 200 else {}
-        return info_data, rosters_data
-    except:
-        return {}, {}
-
-# Chargement des stats NHL et Fantrax
-nhl_stats = fetch_nhl_stats()
-info, rosters_data = fetch_fantrax_data(league_id)
-
-teams_info = info.get("teamInfo", {})
-rosters = rosters_data.get("rosters", {})
-
-if teams_info:
-    team_names = {t_id: t_data.get("name", f"Équipe {t_id}") for t_id, t_data in teams_info.items()}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
-    all_players = {}
-    for t_id, t_roster in rosters.items():
-        t_name = team_names.get(t_id, "Inconnu")
-        for item in t_roster.get("rosterItems", []):
-            p_name = item.get("name", item.get("fullName", ""))
-            p_pos = item.get("position", item.get("pos", "F"))
+    try:
+        res_info = requests.get(info_url, headers=headers).json()
+        res_rosters = requests.get(rosters_url, headers=headers).json()
+    except Exception as e:
+        return {}, {}
+    
+    # 1. Cartographie des équipes
+    teams_raw = res_info.get("teamInfo", {})
+    teams_map = {t_id: t_data.get("name", f"Équipe {t_id}") for t_id, t_data in teams_raw.items()}
+    
+    # 2. Cartographie globale des joueurs (résolution des IDs)
+    player_lookup = {}
+    
+    # Extraire depuis 'playerMap' ou 'scorerInfo' si présent dans la réponse
+    for source in [res_info, res_rosters]:
+        p_source = source.get("playerMap", source.get("scorerInfo", {}))
+        if isinstance(p_source, dict):
+            for pid, pdata in p_source.items():
+                if isinstance(pdata, dict):
+                    p_name = pdata.get("name", pdata.get("fullName"))
+                    p_pos = pdata.get("position", pdata.get("pos", "F"))
+                    if p_name:
+                        player_lookup[pid] = {"name": p_name, "pos": p_pos}
+
+    # 3. Traitement des rosters par équipe
+    rosters = res_rosters.get("rosters", {})
+    parsed_players = {}
+    
+    for t_id, r_data in rosters.items():
+        team_name = teams_map.get(t_id, f"Équipe {t_id}")
+        items = r_data.get("rosterItems", [])
+        
+        for item in items:
+            pid = item.get("id", item.get("playerId"))
             
-            if p_name:
-                # Calcul de la projection de points :
-                # On vérifie si Fantrax donne une valeur, sinon on se fie au statut NHL
-                base_fpts = float(item.get("fpts", 0)) if item.get("fpts") else 0
+            # Résolution du nom : direct -> table globale -> fallback
+            if pid in player_lookup:
+                p_name = player_lookup[pid]["name"]
+                p_pos = player_lookup[pid]["pos"]
+            else:
+                p_name = item.get("name", item.get("fullName", f"Joueur ({pid})"))
+                p_pos = item.get("position", item.get("pos", "F"))
+            
+            # Points Fantrax
+            fpts = item.get("fpts", item.get("fantasyPoints", 0))
+            try:
+                fpts = float(fpts)
+            except:
+                fpts = 0.0
                 
-                if base_fpts == 0:
-                    # Attribution de projections réalistes par défaut basées sur la position
-                    base_fpts = 2.8 if "C" in p_pos or "F" in p_pos else (2.1 if "D" in p_pos else 3.2)
-                
-                all_players[p_name] = {
-                    "team": t_name,
-                    "position": p_pos,
-                    "fpts": base_fpts
-                }
+            parsed_players[p_name] = {
+                "team": team_name,
+                "position": p_pos,
+                "fpts": fpts,
+                "id": pid
+            }
+            
+    return teams_map, parsed_players
 
-    # Sécurité fallback si vide
-    if not all_players:
-        all_players = {
-            "J. Bratt": {"team": "Mon Équipe", "position": "F", "fpts": 10.0},
-            "C. Caufield": {"team": "Mon Équipe", "position": "F", "fpts": 10.0},
-            "J. Hughes": {"team": "Équipe 2", "position": "F", "fpts": 12.0},
-            "N. Kucherov": {"team": "Équipe 2", "position": "F", "fpts": 14.0},
-            "A. Fox": {"team": "Équipe 3", "position": "D", "fpts": 18.0},
-        }
+# Chargement des données
+teams_map, players_data = load_league_from_fantrax(league_id)
 
-    # --- ONGLETS ---
-    tab1, tab2 = st.tabs(["🔄 Simulateur de Trade", "📈 Projections & Base de Joueurs"])
+if players_data:
+    all_teams = sorted(list(set(d["team"] for d in players_data.values())))
+    
+    tab1, tab2 = st.tabs(["🔄 Simulateur de Trade", "📋 Effectifs & Points"])
 
     with tab1:
-        st.subheader("Simulateur d'Échange avec Projections")
+        st.subheader("Simulateur d'Échange (Mock Trade)")
         
-        col_m1, col_m2 = st.columns(2)
-        with col_m1:
-            my_team = st.selectbox("Ton Équipe", options=list(team_names.values()), key="my_team_select")
-            my_team_players = [name for name, data in all_players.items() if data["team"] == my_team]
-            giving = st.multiselect("Joueurs que tu DONNES :", options=my_team_players if my_team_players else list(all_players.keys())[:3])
-
-        with col_m2:
-            other_teams = [t for t in team_names.values() if t != my_team]
-            target_team = st.selectbox("Équipe Adverse", options=other_teams if other_teams else ["Adverse"], key="target_team_select")
-            target_team_players = [name for name, data in all_players.items() if data["team"] == target_team]
-            receiving = st.multiselect("Joueurs que tu REÇOIS :", options=target_team_players if target_team_players else list(all_players.keys())[3:])
+        col1, col2 = st.columns(2)
+        with col1:
+            my_team = st.selectbox("Sélectionne ton équipe :", options=all_teams, key="my_team")
+            my_players = [p for p, d in players_data.items() if d["team"] == my_team]
+            giving = st.multiselect("Joueurs que TU DONNES :", options=sorted(my_players))
+            
+        with col2:
+            other_teams = [t for t in all_teams if t != my_team]
+            target_team = st.selectbox("Sélectionne l'équipe adverse :", options=other_teams if other_teams else all_teams, key="target_team")
+            target_players = [p for p, d in players_data.items() if d["team"] == target_team]
+            receiving = st.multiselect("Joueurs que TU REÇOIS :", options=sorted(target_players))
 
         if giving or receiving:
             st.markdown("---")
             st.markdown("### ⚖️ Résultat de l'Échange")
             
-            pts_given = sum([all_players.get(p, {}).get("fpts", 2.5) for p in giving])
-            pts_received = sum([all_players.get(p, {}).get("fpts", 2.5) for p in receiving])
-            net_diff = pts_received - pts_given
+            pts_given = sum([players_data[p]["fpts"] for p in giving])
+            pts_received = sum([players_data[p]["fpts"] for p in receiving])
+            diff = pts_received - pts_given
 
-            res_c1, res_c2, res_c3 = st.columns(3)
-            res_c1.metric("Points abandonnés", f"{pts_given:.1f} pts")
-            res_c2.metric("Points obtenus", f"{pts_received:.1f} pts")
-            res_c3.metric("Gain Net Projeté", f"{net_diff:+.1f} pts", delta=f"{net_diff:+.1f} pts")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Points donnés", f"{pts_given:.2f} pts")
+            c2.metric("Points reçus", f"{pts_received:.2f} pts")
+            c3.metric("Différence nette", f"{diff:+.2f} pts", delta=f"{diff:+.2f} pts")
 
-            if net_diff > 0:
-                st.success(f"✅ **Trade Avantageux !** Tu gagnes environ **+{net_diff:.1f} points** sur l'échange.")
-            elif net_diff < 0:
-                st.error(f"⚠️ **Attention !** Cet échange te ferait perdre **{abs(net_diff):.1f} points**.")
+            if diff > 0:
+                st.success(f"✅ **EXCELLENT TRADE !** Gain net de **+{diff:.2f} points**.")
+            elif diff < 0:
+                st.error(f"⚠️ **DÉSAVANTAGEUX !** Perte nette de **{abs(diff):.2f} points**.")
             else:
-                st.info("⚖️ **Échange équilibré.**")
+                st.info("⚖️ **ÉCHANGE ÉQUILIBRÉ.**")
 
     with tab2:
-        st.subheader("📋 Liste des Joueurs et Projections")
-        
-        # Option d'ajouter manuellement un modificateur de projection
-        st.write("Ajuste les projections globales ou consulte la liste des joueurs détectés :")
-        
-        df_players = pd.DataFrame([
-            {
-                "Joueur": name, 
-                "Équipe Fantrax": data["team"], 
-                "Position": data["position"], 
-                "Projection Points / Match": data["fpts"]
-            }
-            for name, data in all_players.items()
+        st.subheader("📋 Base de données des joueurs de la ligue")
+        df_display = pd.DataFrame([
+            {"Joueur": p, "Équipe": d["team"], "Position": d["position"], "Points Fantrax": d["fpts"]}
+            for p, d in players_data.items()
         ])
-        st.dataframe(df_players, use_container_width=True)
+        st.dataframe(df_display, use_container_width=True)
 
 else:
-    st.warning("⚠️ Impossible de charger la ligue. Vérifie ton League ID dans la barre latérale.")
+    st.warning("⚠️ Chargement des données de la ligue en cours ou ID invalide.")
